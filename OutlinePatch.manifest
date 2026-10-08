@@ -1,0 +1,13 @@
+{
+    "autodeskProduct": "Fusion",
+    "type": "addin",
+    "id": "d335d048-abf2-49b6-a32e-a6378aef2a28",
+    "author": "Iago Andreu",
+    "description": {
+        "": "Cut the patch of a body that lies inside a 3D sketch outline, exactly, and thicken it into a new body."
+    },
+    "version": "1.0.0",
+    "runOnStartup": true,
+    "supportedOS": "windows|mac",
+    "editEnabled": true
+}

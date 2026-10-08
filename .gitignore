@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+
+# dev bridge: opt-in marker and its job traffic, plus logs
+devbridge.on
+devjobs/
+*.log
+
+# remembered dialog settings
+last_settings.json
