@@ -9,7 +9,7 @@ New-Item -ItemType Directory -Force -Path $dst | Out-Null
 $cache = Join-Path $dst '__pycache__'
 if (Test-Path -LiteralPath $cache) { Remove-Item -LiteralPath $cache -Recurse -Force }
 
-foreach ($f in @('OutlinePatch.py', 'op_core.py', 'OutlinePatch.manifest')) {
+foreach ($f in @('OutlinePatch.py', 'op_core.py', 'op_fit.py', 'OutlinePatch.manifest')) {
     Copy-Item -LiteralPath (Join-Path $src $f) -Destination $dst -Force
 }
 # Copy-Item -Recurse into a directory that ALREADY holds one of the same name

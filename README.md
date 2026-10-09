@@ -14,9 +14,12 @@ surgical guides and baseplates drawn on a bone Form.
 | Keep | the smaller or the larger side of the outline |
 | Thicken | outward along the surface normal, inward, or no thickness (surface only) |
 | Thickness | 3.7 mm by default |
+| Round the outer rim | fillet radius on the top edge, 2 mm by default; 0 = none |
+| Ease corners tighter than | 0 = outline untouched (default); see below |
 
-The result is two timeline entries: **Outline Patch**, a base feature holding the surface
-patch, and **Outline Patch thicken**. Nothing else is left behind.
+The result is the timeline entries **Outline Patch** (a base feature holding the surface
+patch), **Outline Patch thicken** and, with a rim, its fillet. Nothing else is left
+behind.
 
 ## Why not just split the face with the curve
 
@@ -36,6 +39,31 @@ jumps between faces. Here the curve never cuts anything. It only steers a band:
 
 So the cut lands at the closest-point projection of the outline, whatever the
 outline's distance from the body.
+
+## A rounded rim
+
+**Round the outer rim** (2 mm by default) fillets the edge between the top face and the
+side wall. On the Form's own faces no fillet builds at any radius (0.3 mm included):
+43 patch faces thicken into 43 top faces, 85 side walls and an 85-edge rim with edges of
+0.05 mm, and Fusion's Merge Faces refuses to join T-spline faces. So with a rim the patch
+is rebuilt as **one smooth face**: the region is flattened conformally (LSCM, in
+`op_fit.py`, run by an external Python with numpy, scipy and matplotlib), sections are
+laid every 4 mm across one rectangle of that domain, every point over the region is
+projected exactly onto the body, and one face is lofted through them. It is cut with the
+band's centre spline, which lies on it, so the patch has a single closed edge. On the femur
+that face is within 0.097 mm max, 0.010 mm mean of the Form (6 mm sections: 0.29 mm, and
+the rim failed).
+
+A rim also needs room at the outline's **convex corners**: the fillet's spine runs a
+radius inside the rim, R - r round a corner of radius R. The GUIDE outline has convex
+corners down to R 1.66 mm; rims up to 1.8 mm built, 1.9 and 2.0 mm did not (2.1 mm did,
+a degenerate coincidence). **Ease corners tighter than** relaxes only those corners, in
+the surface, and reports the largest move: 3.2 mm let the 2 mm rim build and moved the
+outline by at most 0.50 mm, at seven spots 2.5-5 mm long; the other 650 samples did not
+move. It is off by default, because it changes the outline.
+
+With a rim the run takes about two minutes on the femur (Thicken of the lofted face
+alone ~90 s); without one, ~16 s.
 
 ## Measured
 
@@ -85,6 +113,9 @@ Run (tick *Run on Startup*). `op_core.py` reloads on every click; only
 ```
 py -3.10 tests/test_geometry.py
 ```
+
+The rim's single face needs a Python with numpy, scipy and matplotlib; the add-in looks
+for `OUTLINEPATCH_PYTHON`, then `python_path.txt` beside it, then Python 3.10.
 
 Offline, with `adsk` stubbed: resampling, normal smoothing, the closest point on a
 triangle and the outline distance grid. The pipeline itself is tested live through the

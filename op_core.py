@@ -66,6 +66,11 @@ DEFAULTS = {
     'curtain_mm': 1.5,        # half-height of the cutting band
     'spacing_mm': 0.5,        # outline sampling
     'rail_mm': 1.0,           # spacing of the band's centre-line points
+    'single_face': True,      # loft ONE face over the patch, so the rim can be filleted
+    'rim_mm': 2.0,            # fillet on the outer rim of the thickened body; 0 = none
+    'min_bend_mm': 0.0,       # ease convex outline corners tighter than this; 0 = untouched
+    'sheet_margin_mm': 4.0,   # how far past the outline the single face reaches
+    'section_mm': 4.0,        # spacing of the loft sections
     'keep_patch': True,
 }
 
@@ -127,6 +132,10 @@ def _sub(a, b):
 
 def _add(a, b, s=1.0):
     return (a[0] + s * b[0], a[1] + s * b[1], a[2] + s * b[2])
+
+
+def _cross(a, b):
+    return (a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0])
 
 
 def _dot(a, b):
@@ -220,6 +229,145 @@ def resample_closed(pts, spacing_cm, cap):
 # --------------------------------------------------------------------------- #
 # closest point and outward normal on the body
 # --------------------------------------------------------------------------- #
+
+FIT_ENGINE = os.path.join(ADDIN_DIR, 'op_fit.py')
+LAST_FIT = []          # job and result files of the last engine run, for inspection
+NO_WINDOW = 0x08000000 if os.name == 'nt' else 0
+
+
+def python_cmd():
+    """An interpreter with numpy, scipy and matplotlib (Fusion's has none):
+    OUTLINEPATCH_PYTHON, then python_path.txt beside the add-in, then py -3.10."""
+    import subprocess
+    cands = []
+    if os.environ.get('OUTLINEPATCH_PYTHON'):
+        cands.append([os.environ['OUTLINEPATCH_PYTHON']])
+    try:
+        with open(os.path.join(ADDIN_DIR, 'python_path.txt'), encoding='utf-8') as fh:
+            cands.append([fh.read().strip()])
+    except Exception:
+        pass
+    cands.append([os.path.expandvars(r'%LOCALAPPDATA%\Programs\Python\Python310\python.exe')])
+    cands.append(['py', '-3.10'])
+    for c in cands:
+        try:
+            r = subprocess.run(c + ['-c', 'import numpy, scipy, matplotlib'],
+                               capture_output=True, timeout=60, creationflags=NO_WINDOW)
+            if r.returncode == 0:
+                return c
+        except Exception:
+            pass
+    return None
+
+
+def run_fit(job):
+    import subprocess
+    import tempfile
+    exe = python_cmd()
+    if not exe:
+        raise RuntimeError('the single-face option needs a Python with numpy, scipy and '
+                           'matplotlib; put its path in python_path.txt beside the add-in')
+    d = tempfile.mkdtemp(prefix='outline_patch_')
+    jp, op = os.path.join(d, 'job.json'), os.path.join(d, 'out.json')
+    with open(jp, 'w', encoding='utf-8') as fh:
+        json.dump(job, fh)
+    r = subprocess.run(exe + [FIT_ENGINE, jp, op], capture_output=True, text=True,
+                       timeout=600, creationflags=NO_WINDOW)
+    if not os.path.exists(op):
+        raise RuntimeError('the fit engine produced nothing:\n%s' % r.stderr[-600:])
+    with open(op, encoding='utf-8') as fh:
+        res = json.load(fh)
+    LAST_FIT[:] = [jp, op]
+    if not res.get('ok'):
+        raise RuntimeError('the fit engine failed:\n%s' % res.get('error', '')[-600:])
+    return res
+
+
+def tessellate_faces(faces, tol_cm=0.005):
+    """Triangles of the given faces, in mm: coords, idx and the face index of each."""
+    coords, idx, owner = [], [], []
+    for k, f in enumerate(faces):
+        calc = f.meshManager.createMeshCalculator()
+        calc.surfaceTolerance = tol_cm
+        m = calc.calculate()
+        base = len(coords) // 3
+        coords.extend(v * CM for v in m.nodeCoordinatesAsDouble)
+        ni = m.nodeIndices
+        idx.extend(base + i for i in ni)
+        owner.extend([k] * (len(ni) // 3))
+    return coords, idx, owner
+
+
+def single_face_sheet(comp, body, side, outside_ring, cps, o, notes, created):
+    """ONE lofted face over the patch region, its points exactly on the body.
+
+    Returns (sheet body, its deviation from the body in mm). The loft and its
+    sketch are appended to `created`, to be removed once the patch is lifted out.
+    """
+    faces = list(side) + list(outside_ring)
+    coords, idx, owner = tessellate_faces(faces)
+    inside = [1 if k < len(side) else 0 for k in owner]
+    res = run_fit({'coords': coords, 'idx': idx, 'inside': inside,
+                   'outline': [[c * CM for c in q] for q in cps],
+                   'margin_mm': float(o.get('sheet_margin_mm', 4.0)),
+                   'section_mm': float(o.get('section_mm', 2.0)),
+                   'point_mm': float(o.get('section_mm', 2.0))})
+    notes.extend('fit: ' + l for l in res.get('log', []))
+    secs = [[(q[0] * MM, q[1] * MM, q[2] * MM) for q in sec] for sec in res['sections']]
+    flags = res['on_body']
+    flat = [q for sec, fl in zip(secs, flags) for q, b in zip(sec, fl) if b]
+    proj = Surface(comp, body, flat, 0.05)
+    # points over the region go exactly onto the body; the few past it keep the
+    # fitted surface's smooth extension (they are cut away)
+    exact = [[proj.closest(q)[1] if b else q for q, b in zip(sec, fl)]
+             for sec, fl in zip(secs, flags)]
+
+    sk = comp.sketches.add(comp.xYConstructionPlane)
+    sk.name = 'Outline Patch sections'
+    created.append(sk)
+    sk.isComputeDeferred = True
+    splines = []
+    for sec in exact:
+        coll = adsk.core.ObjectCollection.create()
+        for q in sec:
+            coll.add(sk.modelToSketchSpace(_pt(q)))
+        splines.append(sk.sketchCurves.sketchFittedSplines.add(coll))
+    sk.isComputeDeferred = False
+    lin = comp.features.loftFeatures.createInput(
+        adsk.fusion.FeatureOperations.NewBodyFeatureOperation)
+    lin.isSolid = False
+    for spl in splines:
+        lin.loftSections.add(comp.features.createPath(spl, False))
+    loft = comp.features.loftFeatures.add(lin)
+    created.append(loft)
+    sheet = loft.bodies.item(0)
+    sheet.name = 'Outline Patch sheet'
+
+    return sheet, None
+
+
+
+def deviation_from(comp, face_body, body, n_max=3000):
+    """How far a body's faces stray from another body, sampled on its tessellation."""
+    calc = face_body.meshManager.createMeshCalculator()
+    calc.surfaceTolerance = 0.002
+    m = calc.calculate()
+    xyz = m.nodeCoordinatesAsDouble
+    pts = [(xyz[i], xyz[i + 1], xyz[i + 2]) for i in range(0, len(xyz), 3)]
+    pts = pts[::max(1, len(pts) // n_max)]
+    proj = Surface(comp, body, pts, 0.05)
+    devs = []
+    for q in pts:
+        try:
+            devs.append(proj.closest(q)[0] * CM)
+        except ValueError:
+            pass
+    devs.sort()
+    if not devs:
+        return None
+    return {'max_mm': round(devs[-1], 4), 'p99_mm': round(devs[int(0.99 * (len(devs) - 1))], 4),
+            'mean_mm': round(sum(devs) / len(devs), 4), 'points': len(devs)}
+
 
 def _closest_on_triangle(p, a, b, c):
     """Closest point to p on triangle abc (Ericson, Real-Time Collision Detection)."""
@@ -416,6 +564,54 @@ class Surface:
         return _norm(_sub(p, q)), q, (n[0] * s, n[1] * s, n[2] * s)
 
 
+def bend_curvature(cps, nrm, step):
+    """Signed curvature of the outline IN the surface (geodesic), per sample, 1/cm.
+    Positive bends towards the inside of the loop (a convex corner of the patch),
+    negative away from it (a notch)."""
+    n = len(cps)
+    t = [_unit(_sub(cps[(i + 1) % n], cps[i - 1])) for i in range(n)]
+    kg = []
+    for i in range(n):
+        dt = _sub(t[(i + 1) % n], t[i - 1])
+        b = _unit(_cross(nrm[i], t[i]))       # in the surface, to the left of travel
+        kg.append(_dot(dt, b) / (2.0 * step))
+    # which side is inside: the loop's total turning is positive walking with the
+    # inside on the left
+    if sum(kg) < 0:
+        kg = [-k for k in kg]
+    return kg
+
+
+def ease_bends(surf, cps, nrm, step, r_min, max_iter=400):
+    """Relax only the CONVEX corners tighter than r_min, in the surface, keeping every
+    point on the body. Returns (points, normals, largest displacement in cm).
+
+    A rim fillet's spine runs r inside the rim: R - r round a convex corner of
+    radius R, which goes negative when R < r and the fillet cannot build;
+    R + r round a notch, which is always fine. Measured on the femur guide:
+    tightest convex corner 1.66 mm, rims of 1.8 mm built and 1.9 mm did not;
+    easing the notches instead changed nothing."""
+    pts, nrs = list(cps), list(nrm)
+    orig = list(cps)
+    n = len(pts)
+    for _ in range(max_iter):
+        kg = bend_curvature(pts, nrs, step)
+        tight = [i for i in range(n) if kg[i] > 1.0 / r_min]
+        if not tight:
+            break
+        move = set()
+        for i in tight:
+            for j in range(-3, 4):
+                move.add((i + j) % n)
+        for i in move:
+            lap = _sub(_add(pts[i - 1], pts[(i + 1) % n]), _add(pts[i], pts[i]))
+            lap = _sub(lap, _add((0, 0, 0), nrs[i], _dot(lap, nrs[i])))   # tangential only
+            _d, q, nn = surf.closest(_add(pts[i], lap, 0.25))
+            pts[i], nrs[i] = q, nn
+    moved = max(_norm(_sub(a, b)) for a, b in zip(pts, orig))
+    return pts, nrs, moved
+
+
 def smooth_normals(normals, step_cm, sigma_cm):
     """Gaussian smoothing of unit normals along a closed outline, renormalised."""
     n = len(normals)
@@ -590,6 +786,13 @@ def _regions(body, boundary):
     return list(groups.values())
 
 
+def _collection(items):
+    coll = adsk.core.ObjectCollection.create()
+    for it in items:
+        coll.add(it)
+    return coll
+
+
 def _delete_quietly(items, notes):
     for it in items:
         try:
@@ -631,6 +834,12 @@ def make_patch(app, curves, body, o):
         cps.append(q)
         nrm.append(n)
     tm['project'] = round(time.time() - t1, 2)
+    kg0 = bend_curvature(cps, nrm, step)
+    conv = [k for k in kg0 if k > 0]
+    bend_before = (1.0 / max(conv)) * CM if conv else None
+    eased = 0.0
+    if float(o.get('min_bend_mm', 0.0)) > 0:
+        cps, nrm, eased = ease_bends(surf, cps, nrm, step, float(o['min_bend_mm']) * MM)
     # 3. normals smoothed along the outline: the "interpolate the path" step
     nrm_s = smooth_normals(nrm, step, float(o['smooth_mm']) * MM)
     turn = max(math.degrees(math.acos(max(-1.0, min(1.0, _dot(a, b)))))
@@ -760,6 +969,52 @@ def make_patch(app, curves, body, o):
         side_ids = set(f.tempId for f in side)
         keep_pts = [f.pointOnFace for f in side]
 
+        sheet_dev = None
+        want_single = (o.get('single_face', True) and float(o.get('rim_mm', 0)) > 0
+                       and o['direction'] != DIR_NONE)
+        if want_single and o['keep'] == KEEP_SMALL:
+            # one smooth face instead of the Form's many: the faces across the cut
+            # from the patch give the sheet its margin
+            ring = {}
+            for e in work.edges:
+                if e.tempId in boundary:
+                    for f in e.faces:
+                        if f.tempId not in side_ids:
+                            ring[f.tempId] = f
+            sheet, sheet_dev = single_face_sheet(comp, body, side, ring.values(), cps,
+                                                 o, notes, created)
+            tm['single_face'] = round(time.time() - t1, 2)
+            t1 = time.time()
+            # On ONE face, with a curve that lies on it, imprinting is reliable,
+            # and it gives the patch a single closed edge. Cut by the band, the
+            # same sheet came out with a 109-edge boundary, a 109-face side wall
+            # after the thicken, and a rim no fillet would build on.
+            centre_spl = cleanup[0].sketchCurves.item(0)
+            try:
+                sfi2 = comp.features.splitFaceFeatures.createInput(
+                    _collection(list(sheet.faces)), centre_spl, False)
+                sfi2.setClosestPointSplitType()
+                split2 = comp.features.splitFaceFeatures.add(sfi2)
+                notes.append('single face cut by the centre spline')
+            except Exception:
+                notes.append('centre-spline cut refused (%s), cutting with the band'
+                             % short_error(traceback.format_exc()))
+                sfi2 = comp.features.splitFaceFeatures.createInput(
+                    _collection(list(sheet.faces)), tool, False)
+                split2 = comp.features.splitFaceFeatures.add(sfi2)
+            created.append(split2)
+            sheet = split2.bodies.item(0) if split2.bodies.count else sheet
+            # the patch is the face that reaches no open edge of the sheet
+            inner = [f for f in sheet.faces
+                     if all(e.faces.count == 2 for e in f.edges)]
+            if len(inner) != 1:
+                raise RuntimeError('cutting the single face left %d inner faces'
+                                   % len(inner))
+            work = sheet
+            side = inner
+            side_ids = set(f.tempId for f in side)
+            keep_pts = [f.pointOnFace for f in side]
+
         tm['cut_and_regions'] = round(time.time() - t1, 2)
         t1 = time.time()
         # 8. lift the kept faces out as a surface patch
@@ -798,19 +1053,36 @@ def make_patch(app, curves, body, o):
            'outline_to_body_max_mm': round(max(off) * CM, 3),
            'outline_to_body_mean_mm': round(sum(off) / len(off) * CM, 3),
            'normal_smoothing_turn_max_deg': round(turn, 2),
+           'tightest_convex_bend_mm': round(bend_before, 2) if bend_before else None,
+           'outline_eased_mm': round(eased * CM, 3),
            'faces_crossed': len(surf.faces_hit), 'faces_split': len(near_faces),
            'faces_tessellated': surf.n_faces,
            'foot_angle_worst_deg': round(getattr(surf, 'worst_angle', 0.0), 3),
            'cut_edges': len(boundary),
            'cut_to_outline_max_mm': round(bmax * CM, 4),
            'patch': patch.name, 'patch_faces': patch.faces.count,
-           'patch_area_mm2': round(patch.area * 100.0, 2)}
+           'patch_area_mm2': round(patch.area * 100.0, 2),
+           'patch_edges': patch.edges.count,
+           'single_face_dev': (deviation_from(comp, patch, body)
+                               if sheet_dev is not None or (want_single and patch.faces.count == 1)
+                               else None)}
 
     tm['patch_body'] = round(time.time() - t1, 2)
     t1 = time.time()
     # 9. thicken into a new body
     if o['direction'] != DIR_NONE and float(o['thickness_mm']) > 0:
         t = float(o['thickness_mm']) * MM * (1.0 if o['direction'] == DIR_OUT else -1.0)
+        # a lofted face has its own normal: make "outward" the body's outward
+        pf = patch.faces.item(0)
+        q = _tup(pf.pointOnFace)
+        ok, uv = pf.evaluator.getParameterAtPoint(_pt(q))
+        ok, npf = pf.evaluator.getNormalAtParameter(uv)
+        npf = _unit(_tup(npf))
+        if pf.isParamReversed:
+            npf = (-npf[0], -npf[1], -npf[2])
+        _d, _q, nbody = Surface(comp, body, [q], 0.05).closest(q)
+        if _dot(npf, nbody) < 0:
+            t = -t
         faces = adsk.core.ObjectCollection.create()
         for f in patch.faces:
             faces.add(f)
@@ -831,6 +1103,23 @@ def make_patch(app, curves, body, o):
                     'shells': solid.shells.count, 'solid_faces': solid.faces.count})
         if not o.get('keep_patch', True):
             patch.isLightBulbOn = False
+        r_rim = float(o.get('rim_mm', 0.0))
+        if r_rim > 0:
+            t2 = time.time()
+            edges, _counts = outer_perimeter(solid, patch, abs(t))
+            ok, msg = _try_fillet(comp, edges, r_rim * MM, True)
+            rep['rim'] = {'radius_mm': r_rim, 'edges': len(edges), 'ok': ok,
+                          'msg': '' if ok else msg[:200]}
+            if not ok and bend_before and bend_before < r_rim * 1.6:
+                rep['rim']['hint'] = (
+                    'the outline has convex corners down to R %.2f mm; a rim needs '
+                    'clearly more room than its radius. Use a smaller rim, or ease the '
+                    'corners (Advanced, about %.1f mm for a %.1f mm rim) - it moves the '
+                    'outline locally and the report says by how much.'
+                    % (bend_before, 1.6 * r_rim, r_rim))
+            if ok:
+                rep['volume_mm3'] = round(solid.volume * 1000.0, 2)
+            tm['rim'] = round(time.time() - t2, 2)
     tm['thicken'] = round(time.time() - t1, 2)
     rep['timing_s'] = tm
     rep['loose_feet'] = getattr(surf, 'loose_feet', 0)
@@ -847,11 +1136,23 @@ def format_report(r):
         % (r['outline_to_body_max_mm'], r['outline_to_body_mean_mm']),
         'Cut edge follows the projected outline to %.4f mm (%d edges)'
         % (r['cut_to_outline_max_mm'], r['cut_edges']),
+        'Tightest convex corner of the outline: R %.2f mm%s' % (
+            r.get('tightest_convex_bend_mm') or 0,
+            ('; bends eased, outline moved %.3f mm max' % r['outline_eased_mm'])
+            if r.get('outline_eased_mm') else ''),
         'Patch: %d faces, %.1f mm2' % (r['patch_faces'], r['patch_area_mm2']),
     ]
+    if r.get('single_face_dev'):
+        lines.append('Single face follows the body to %.4f mm max, %.4f mean'
+                     % (r['single_face_dev']['max_mm'], r['single_face_dev']['mean_mm']))
     if 'body' in r:
         lines.append('Body "%s": %.1f mm3, %d shell(s)'
                      % (r['body'], r['volume_mm3'], r['shells']))
+    if r.get('rim'):
+        lines.append('Rim %.1f mm: %s' % (r['rim']['radius_mm'],
+                     'rounded' if r['rim']['ok'] else 'NOT rounded'))
+        if r['rim'].get('hint'):
+            lines.append('  ' + r['rim']['hint'])
     lines.append('%.1f s' % r['secs'])
     return '\n'.join(lines)
 
@@ -890,6 +1191,20 @@ def on_created(app, cmd):
                          adsk.core.ValueInput.createByReal(o['thickness_mm'] * MM))
     inputs.addBoolValueInput('keep_patch', 'Keep the surface patch visible', True, '',
                              bool(o['keep_patch']))
+    v = inputs.addValueInput('rim', 'Round the outer rim', 'mm',
+                             adsk.core.ValueInput.createByReal(o['rim_mm'] * MM))
+    v.tooltip = ('Fillet radius on the outer rim of the thickened body; 0 for none.\n\n'
+                 'With a rim, the patch is rebuilt as ONE smooth face through points on '
+                 'the body (within ~0.1 mm of it), because the many faces of a Form give '
+                 'a rim no fillet builds on. A rim needs convex corners of the outline '
+                 'clearly rounder than its radius.')
+    v = inputs.addValueInput('min_bend', 'Ease corners tighter than', 'mm',
+                             adsk.core.ValueInput.createByReal(o['min_bend_mm'] * MM))
+    v.tooltip = ('0 leaves the outline exactly as drawn. Otherwise convex corners of '
+                 'the outline tighter than this radius are relaxed, in the surface, '
+                 'until they are not - only there. The report gives the largest move. '
+                 'On the femur guide, 3.2 mm let a 2 mm rim build and moved the outline '
+                 'by at most 0.5 mm at seven spots.')
 
     adv = inputs.addGroupCommandInput('advanced', 'Advanced')
     adv.isExpanded = False
@@ -926,13 +1241,16 @@ def read_options(inputs):
         'curtain_mm': inputs.itemById('curtain').value * CM,
         'spacing_mm': inputs.itemById('spacing').value * CM,
         'rail_mm': inputs.itemById('rail').value * CM,
+        'rim_mm': inputs.itemById('rim').value * CM,
+        'min_bend_mm': inputs.itemById('min_bend').value * CM,
     }
 
 
 def on_input_changed(app, inputs, changed_id):
     if changed_id == 'direction':
-        inputs.itemById('thickness').isEnabled = (
-            inputs.itemById('direction').selectedItem.name != DIR_NONE)
+        solid = inputs.itemById('direction').selectedItem.name != DIR_NONE
+        inputs.itemById('thickness').isEnabled = solid
+        inputs.itemById('rim').isEnabled = solid
 
 
 def on_validate(inputs):
@@ -940,6 +1258,8 @@ def on_validate(inputs):
             inputs.itemById('body').selectionCount == 1 and
             inputs.itemById('spacing').value > 0 and
             inputs.itemById('rail').value > 0 and
+            inputs.itemById('rim').value >= 0 and
+            inputs.itemById('min_bend').value >= 0 and
             inputs.itemById('curtain').value > 0)
 
 
@@ -957,6 +1277,8 @@ def on_execute(app, ui, inputs):
         return
     state().last_report = format_report(r)
     log(json.dumps(r))
+    if r.get('rim') and not r['rim']['ok']:
+        ui.messageBox(format_report(r), CMD_NAME)
 
 
 def on_destroy(app):
@@ -1036,7 +1358,7 @@ def _sketch_by_name(app, name):
 
 def dev_ping(app, job):
     d = _design(app)
-    return {'doc': app.activeDocument.name if app.activeDocument else None,
+    return {'last_fit': LAST_FIT,'doc': app.activeDocument.name if app.activeDocument else None,
             'docs': [app.documents.item(i).name for i in range(app.documents.count)],
             'parametric': is_parametric(d) if d else None}
 
@@ -1175,7 +1497,115 @@ def dev_make_from_files(app, job):
             'fit_points': coll.count}
 
 
+def outer_perimeter(solid, patch, thickness_cm):
+    """The edges between the offset (top) faces of a thickened patch and its side
+    walls. Faces are told apart by where they sit relative to the patch: the top
+    ones a thickness away with the same normal, the walls across it."""
+    comp = solid.parentComponent
+    face_pts = [_tup(f.pointOnFace) for f in solid.faces]
+    surf = Surface(comp, patch, face_pts, 0.05)
+    kind = {}
+    for f, p in zip(solid.faces, face_pts):
+        ev = f.evaluator
+        ok, uv = ev.getParameterAtPoint(_pt(p))
+        ok, n = ev.getNormalAtParameter(uv)
+        n = _unit(_tup(n))
+        sgn = -1.0 if f.isParamReversed else 1.0
+        probe = _add(p, n, 0.01 * sgn)
+        if solid.pointContainment(_pt(probe)) == \
+                adsk.fusion.PointContainment.PointInsidePointContainment:
+            sgn = -sgn
+        n = (n[0] * sgn, n[1] * sgn, n[2] * sgn)
+        d, _q, npatch = surf.closest(p)
+        dot = _dot(n, npatch)
+        if abs(dot) < 0.5:
+            kind[f.tempId] = 'side'
+        elif d > 0.5 * thickness_cm:
+            kind[f.tempId] = 'top'
+        else:
+            kind[f.tempId] = 'bottom'
+    edges = []
+    for e in solid.edges:
+        ks = sorted(kind.get(f.tempId) for f in e.faces)
+        if ks == ['side', 'top']:
+            edges.append(e)
+    counts = {}
+    for k in kind.values():
+        counts[k] = counts.get(k, 0) + 1
+    return edges, counts
+
+
+def _order_chain(edges):
+    """Edges of a closed loop in walking order."""
+    left = list(edges)
+    out = [left.pop(0)]
+    v = out[0].endVertex
+    while left:
+        nxt = None
+        for i, e in enumerate(left):
+            if e.startVertex == v or e.endVertex == v:
+                nxt = i
+                break
+        if nxt is None:
+            out.extend(left)
+            break
+        e = left.pop(nxt)
+        v = e.endVertex if e.startVertex == v else e.startVertex
+        out.append(e)
+    return out
+
+
+def _try_fillet(comp, edges, r_cm, keep, chain=True):
+    coll = adsk.core.ObjectCollection.create()
+    for e in edges:
+        coll.add(e)
+    fin = comp.features.filletFeatures.createInput()
+    fin.edgeSetInputs.addConstantRadiusEdgeSet(
+        coll, adsk.core.ValueInput.createByReal(r_cm), chain)
+    try:
+        f = comp.features.filletFeatures.add(fin)
+    except Exception:
+        return False, short_error(traceback.format_exc())
+    if not keep:
+        f.deleteMe()
+    return True, f.name if keep else ''
+
+
+def dev_fillet(app, job):
+    """Fillet the outer perimeter of a thickened patch; on failure, find where."""
+    solid = _body_by_name(app, job['body'])
+    patch = _body_by_name(app, job['patch'])
+    comp = solid.parentComponent
+    edges, counts = outer_perimeter(solid, patch, float(job.get('thickness_mm', 3.7)) * MM)
+    lens = sorted(e.length * CM for e in edges)
+    out = {'faces': counts, 'perimeter_edges': len(edges),
+           'perimeter_mm': round(sum(lens), 2),
+           'shortest_mm': [round(x, 4) for x in lens[:5]]}
+    r = float(job.get('radius_mm', 2.0)) * MM
+    for rr in job.get('also_mm', []):
+        okr, _m = _try_fillet(comp, edges, rr * MM, False)
+        out['whole_%gmm' % rr] = okr
+    ok, msg = _try_fillet(comp, edges, r, bool(job.get('keep')))
+    out['whole'] = {'ok': ok, 'msg': msg}
+    if not ok and job.get('locate', True):
+        # walk the chain in pieces to see where a fillet of this radius breaks
+        chain = _order_chain(edges)
+        k = int(job.get('pieces', 12))
+        per = max(1, len(chain) // k)
+        pieces = []
+        for i in range(0, len(chain), per):
+            part = chain[i:i + per]
+            okp, msgp = _try_fillet(comp, part, r, False, chain=False)
+            mid = _edge_points(part[len(part) // 2], 1)[0]
+            pieces.append({'edges': len(part), 'ok': okp,
+                           'at_mm': [round(v * CM, 1) for v in mid],
+                           'msg': '' if okp else msgp[:160]})
+        out['pieces'] = pieces
+    return out
+
+
 DEV_COMMANDS = {
+    'fillet': dev_fillet,
     'make_from_files': dev_make_from_files,
     'remove_last': dev_remove_last,
     'ping': dev_ping,
