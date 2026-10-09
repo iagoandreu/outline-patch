@@ -47,7 +47,7 @@ side wall. On the Form's own faces no fillet builds at any radius (0.3 mm includ
 43 patch faces thicken into 43 top faces, 85 side walls and an 85-edge rim with edges of
 0.05 mm, and Fusion's Merge Faces refuses to join T-spline faces. So with a rim the patch
 is rebuilt as **one smooth face**: the region is flattened conformally (LSCM, in
-`op_fit.py`, run by an external Python with numpy, scipy and matplotlib), sections are
+`op_fit.py`, run by an external Python with numpy and scipy), sections are
 laid every 4 mm across one rectangle of that domain, every point over the region is
 projected exactly onto the body, and one face is lofted through them. It is cut with the
 band's centre spline, which lies on it, so the patch has a single closed edge. On the femur
@@ -114,7 +114,7 @@ Run (tick *Run on Startup*). `op_core.py` reloads on every click; only
 py -3.10 tests/test_geometry.py
 ```
 
-The rim's single face needs a Python with numpy, scipy and matplotlib; the add-in looks
+The rim's single face needs a Python with numpy and scipy; the add-in looks
 for `OUTLINEPATCH_PYTHON`, then `python_path.txt` beside it, then Python 3.10.
 
 Offline, with `adsk` stubbed: resampling, normal smoothing, the closest point on a

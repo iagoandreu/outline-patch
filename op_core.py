@@ -236,7 +236,7 @@ NO_WINDOW = 0x08000000 if os.name == 'nt' else 0
 
 
 def python_cmd():
-    """An interpreter with numpy, scipy and matplotlib (Fusion's has none):
+    """An interpreter with numpy and scipy (Fusion's has none):
     OUTLINEPATCH_PYTHON, then python_path.txt beside the add-in, then py -3.10."""
     import subprocess
     cands = []
@@ -251,7 +251,7 @@ def python_cmd():
     cands.append(['py', '-3.10'])
     for c in cands:
         try:
-            r = subprocess.run(c + ['-c', 'import numpy, scipy, matplotlib'],
+            r = subprocess.run(c + ['-c', 'import numpy, scipy'],
                                capture_output=True, timeout=60, creationflags=NO_WINDOW)
             if r.returncode == 0:
                 return c
@@ -265,8 +265,8 @@ def run_fit(job):
     import tempfile
     exe = python_cmd()
     if not exe:
-        raise RuntimeError('the single-face option needs a Python with numpy, scipy and '
-                           'matplotlib; put its path in python_path.txt beside the add-in')
+        raise RuntimeError('the single-face option needs a Python with numpy and scipy; '
+                           'put its path in python_path.txt beside the add-in')
     d = tempfile.mkdtemp(prefix='outline_patch_')
     jp, op = os.path.join(d, 'job.json'), os.path.join(d, 'out.json')
     with open(jp, 'w', encoding='utf-8') as fh:
@@ -1568,7 +1568,9 @@ def _try_fillet(comp, edges, r_cm, keep, chain=True):
         return False, short_error(traceback.format_exc())
     if not keep:
         f.deleteMe()
-    return True, f.name if keep else ''
+        return True, ''
+    f.name = 'Outline Patch rim'
+    return True, f.name
 
 
 def dev_fillet(app, job):

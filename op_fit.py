@@ -1,4 +1,4 @@
-"""Outline Patch engine - runs in a Python with numpy, scipy and matplotlib.
+"""Outline Patch engine - runs in a Python with numpy and scipy.
 
     python op_fit.py job.json out.json
 
@@ -178,10 +178,26 @@ def main():
     # sections jump by up to 14 mm wherever the region is not convex, and the
     # loft folded. Positions come from a smooth tensor B-spline fitted to the
     # whole region, which also carries the sheet a little past the data.
-    import matplotlib.tri as mtri
     from scipy.interpolate import BSpline
-    tri = mtri.Triangulation(uv[:, 0], uv[:, 1], f)
-    finder = tri.get_trifinder()
+
+    # Which domain points lie over the region. Not matplotlib's TriFinder: it
+    # rejects a triangulation with any fold, and sliver faces along an old
+    # imprint left 6 folded triangles of 5770 in the femur's flattening.
+    cuv = uv[f].mean(1)
+    ctree = cKDTree(cuv)
+
+    def over_region(q):
+        _d, near = ctree.query(q, k=min(12, len(f)))
+        hit = np.zeros(len(q), bool)
+        for col in range(near.shape[1]):
+            t = near[:, col]
+            A, B, C = uv[f[t, 0]], uv[f[t, 1]], uv[f[t, 2]]
+            den = (B[:, 1] - C[:, 1]) * (A[:, 0] - C[:, 0]) + (C[:, 0] - B[:, 0]) * (A[:, 1] - C[:, 1])
+            den = np.where(np.abs(den) < 1e-18, 1e-18, den)
+            l1 = ((B[:, 1] - C[:, 1]) * (q[:, 0] - C[:, 0]) + (C[:, 0] - B[:, 0]) * (q[:, 1] - C[:, 1])) / den
+            l2 = ((C[:, 1] - A[:, 1]) * (q[:, 0] - C[:, 0]) + (A[:, 0] - C[:, 0]) * (q[:, 1] - C[:, 1])) / den
+            hit |= (l1 >= -1e-9) & (l2 >= -1e-9) & (1 - l1 - l2 >= -1e-9)
+        return hit
     ins_v = np.unique(f[inside_kept])
     lo = uv[ins_v].min(0) - margin
     hi = uv[ins_v].max(0) + margin
@@ -223,9 +239,9 @@ def main():
         Bu_s = BSpline.design_matrix(np.array([u]), tu, k).toarray()
         Ak = (Bu_s[:, :, None] * Bv_s[:, None, :]).reshape(len(vs), nu * nv)
         P = Ak @ ctrl
-        t = finder(np.full(len(vs), u), vs)
+        inside_pts = over_region(np.c_[np.full(len(vs), u), vs])
         sections.append(P.tolist())
-        on_body.append((t >= 0).astype(int).tolist())
+        on_body.append(inside_pts.astype(int).tolist())
     log.append('%d sections of %d points over %.1f x %.1f mm of domain'
                % (len(sections), len(vs), hi[0] - lo[0], hi[1] - lo[1]))
     json.dump({'ok': True, 'sections': sections, 'on_body': on_body, 'log': log,
