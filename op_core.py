@@ -72,6 +72,7 @@ DEFAULTS = {
     'sheet_margin_mm': 4.0,   # how far past the outline the single face reaches
     'section_mm': 4.0,        # spacing of the loft sections
     'keep_patch': True,
+    'gap_mm': 0.0,            # clearance: the patch is offset this far off the body first
 }
 
 MAX_SAMPLES = 900
@@ -1060,7 +1061,8 @@ def make_patch(app, curves, body, o):
            'foot_angle_worst_deg': round(getattr(surf, 'worst_angle', 0.0), 3),
            'cut_edges': len(boundary),
            'cut_to_outline_max_mm': round(bmax * CM, 4),
-           'patch': patch.name, 'patch_faces': patch.faces.count,
+           'patch': patch.name, 'patch_token': patch.entityToken,
+           'patch_faces': patch.faces.count,
            'patch_area_mm2': round(patch.area * 100.0, 2),
            'patch_edges': patch.edges.count,
            'single_face_dev': (deviation_from(comp, patch, body)
@@ -1086,6 +1088,23 @@ def make_patch(app, curves, body, o):
         faces = adsk.core.ObjectCollection.create()
         for f in patch.faces:
             faces.add(f)
+        sheet = patch
+        gap = float(o.get('gap_mm', 0.0))
+        if gap > 0:
+            # a clearance: the patch offset away from the body first, and THAT
+            # thickened - the solid starts gap mm off the surface everywhere
+            before = set(b.entityToken for b in comp.bRepBodies)
+            oin = comp.features.offsetFeatures.createInput(
+                faces, adsk.core.ValueInput.createByReal(gap * MM * (1.0 if t > 0 else -1.0)),
+                adsk.fusion.FeatureOperations.NewBodyFeatureOperation, False)
+            of = comp.features.offsetFeatures.add(oin)
+            of.name = 'Outline Patch clearance'
+            sheet = next(b for b in of.bodies if b.entityToken not in before)
+            sheet.name = '%s clearance %.2f mm' % (stem, gap)
+            faces = adsk.core.ObjectCollection.create()
+            for f in sheet.faces:
+                faces.add(f)
+            rep['gap_mm'] = gap
         before = set(b.entityToken for b in comp.bRepBodies)
         tin = comp.features.thickenFeatures.createInput(
             faces, adsk.core.ValueInput.createByReal(t), False,
@@ -1100,13 +1119,16 @@ def make_patch(app, curves, body, o):
             raise RuntimeError('the thicken produced no new solid')
         solid.name = '%s %.2f mm' % (stem, float(o['thickness_mm']))
         rep.update({'body': solid.name, 'volume_mm3': round(solid.volume * 1000.0, 2),
-                    'shells': solid.shells.count, 'solid_faces': solid.faces.count})
+                    'shells': solid.shells.count, 'solid_faces': solid.faces.count,
+                    'body_token': solid.entityToken})
         if not o.get('keep_patch', True):
             patch.isLightBulbOn = False
+            if sheet is not patch:
+                sheet.isLightBulbOn = False
         r_rim = float(o.get('rim_mm', 0.0))
         if r_rim > 0:
             t2 = time.time()
-            edges, _counts = outer_perimeter(solid, patch, abs(t))
+            edges, _counts = outer_perimeter(solid, sheet, abs(t))
             ok, msg = _try_fillet(comp, edges, r_rim * MM, True)
             rep['rim'] = {'radius_mm': r_rim, 'edges': len(edges), 'ok': ok,
                           'msg': '' if ok else msg[:200]}
