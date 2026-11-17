@@ -89,6 +89,11 @@ In the component that owns the body:
   `Sketch3 3.70 mm`;
 - with a rim that built: a fillet feature **Outline Patch rim**.
 
+Scripts can also pass `gap_mm` in the options (not in the dialog). The patch is
+then offset that far off the body first (an **Outline Patch clearance** offset
+feature, a surface body `<outline sketch name> clearance <gap> mm`), and that
+surface is thickened, so the solid starts `gap_mm` off the bone everywhere.
+
 The original body and the outline are not changed. The working copies, bands and
 helper sketches are removed at the end.
 
