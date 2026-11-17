@@ -1114,7 +1114,7 @@ def make_patch(app, curves, body, o):
                 rep['rim']['hint'] = (
                     'the outline has convex corners down to R %.2f mm; a rim needs '
                     'clearly more room than its radius. Use a smaller rim, or ease the '
-                    'corners (Advanced, about %.1f mm for a %.1f mm rim) - it moves the '
+                    'corners (Ease corners tighter than, about %.1f mm for a %.1f mm rim) - it moves the '
                     'outline locally and the report says by how much.'
                     % (bend_before, 1.6 * r_rim, r_rim))
             if ok:
